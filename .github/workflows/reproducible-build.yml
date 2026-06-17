@@ -91,6 +91,17 @@ jobs:
           mkdir -p ctx
           docker build -t rskj-repro:build -f out/Dockerfile ctx
 
+      - name: Extract built artifacts
+        run: |
+          set -euo pipefail
+          # The artifacts live inside the image (runner stage WORKDIR /home/rsk).
+          # Use a created (not run) container so the node ENTRYPOINT never starts.
+          cid=$(docker create rskj-repro:build)
+          mkdir -p artifacts
+          docker cp "$cid":/home/rsk/. artifacts/
+          docker rm "$cid" >/dev/null
+          ls -l artifacts
+
       - name: Compute artifact hashes
         id: hashes
         run: |
@@ -129,6 +140,7 @@ jobs:
             echo ""
             echo "Target directory in \`reproducible-builds\`: \`${dir}\`"
             echo "Open PR: \`${OPEN_PR}\`"
+            echo "Built jars attached to this run as artifact: \`rskj-${TAG}-artifacts\`"
             echo ""
             echo "### Artifact hashes"
             echo '```'
@@ -155,6 +167,13 @@ jobs:
             echo '```'
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: rskj-${{ inputs.tag }}-artifacts
+          path: artifacts/
+          if-no-files-found: error
 
       # ----- everything below only runs when open_pr == true -----
 
