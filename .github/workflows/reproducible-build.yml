@@ -1,0 +1,214 @@
+name: Reproducible build
+
+# Manually-dispatched reproducible build for a published rskj tag.
+#
+# What it does:
+#   1. Builds the artifacts for the given tag inside the pinned, hermetic
+#      Dockerfile (the build fetches the tag itself — the runner checkout is
+#      only used for the templates).
+#   2. Computes the sha256 hashes of the produced artifacts and writes them,
+#      plus the Dockerfile/README it would publish, into the job summary.
+#   3. (Optional) When `open_pr` is true, opens a PR against
+#      rsksmart/reproducible-builds adding the rskj/<version>-<modifier> dir.
+#
+# Trust model: this workflow is the *first builder / PR author* only. Merging a
+# generated PR still REQUIRES an independent rebuild confirming the same hashes
+# — CI is intentionally not the sole witness.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published rskj tag to build (e.g. VETIVER-9.0.3)'
+        required: true
+        type: string
+      open_pr:
+        description: 'Open a PR against rsksmart/reproducible-builds with the result'
+        required: false
+        default: false
+        type: boolean
+
+# Read-only by default; the PR is opened with a scoped GitHub App token, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+jobs:
+  reproducible-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (templates live on this ref)
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Resolve version and modifier from the tag
+        id: ver
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Resolve from canonical upstream, NOT `origin` — when this workflow
+          # runs on a fork, `origin` is the fork and won't carry release tags.
+          # This is the same public repo the build below fetches the tag from.
+          git fetch --depth 1 https://github.com/rsksmart/rskj.git "refs/tags/${TAG}:refs/tags/${TAG}"
+          props=$(git show "${TAG}:rskj-core/src/main/resources/version.properties")
+          version=$(printf '%s\n' "$props" | sed -n "s/^versionNumber=['\"]\(.*\)['\"].*/\1/p")
+          modifier=$(printf '%s\n' "$props" | sed -n "s/^modifier=['\"]\(.*\)['\"].*/\1/p")
+          if [ -z "$version" ] || [ -z "$modifier" ]; then
+            echo "::error::could not parse version.properties at ${TAG}"; exit 1
+          fi
+          modifier_lc=$(printf '%s' "$modifier" | tr '[:upper:]' '[:lower:]')
+          echo "version=$version"           >> "$GITHUB_OUTPUT"
+          echo "modifier=$modifier"         >> "$GITHUB_OUTPUT"
+          echo "modifier_lc=$modifier_lc"   >> "$GITHUB_OUTPUT"
+          echo "Resolved ${TAG} -> version=$version modifier=$modifier"
+
+      - name: Render Dockerfile and README from templates
+        env:
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          MODIFIER: ${{ steps.ver.outputs.modifier }}
+          MODIFIER_LC: ${{ steps.ver.outputs.modifier_lc }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          sed -e "s|__TAG__|${TAG}|g" \
+              -e "s|__VERSION__|${VERSION}|g" \
+              -e "s|__MODIFIER__|${MODIFIER}|g" \
+              .github/reproducible-build/Dockerfile.tmpl > out/Dockerfile
+          # README is rendered after the hashes are known (see below); stash the
+          # template's non-hash substitutions now.
+          sed -e "s|__TAG__|${TAG}|g" \
+              -e "s|__VERSION__|${VERSION}|g" \
+              -e "s|__MODIFIER_LC__|${MODIFIER_LC}|g" \
+              .github/reproducible-build/README.md.tmpl > out/README.partial.md
+
+      - name: Build the reproducible image
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # The Dockerfile is fully hermetic (it git-fetches the tag itself), so
+          # the build context is irrelevant — send an empty one to keep it fast.
+          mkdir -p ctx
+          docker build -t rskj-repro:build -f out/Dockerfile ctx
+
+      - name: Compute artifact hashes
+        id: hashes
+        run: |
+          set -euo pipefail
+          # Same command the README documents, so summary == README == a
+          # verifier's local check, byte for byte.
+          hashes=$(docker run --rm rskj-repro:build sh -c 'sha256sum * | grep -v javadoc.jar')
+          printf '%s\n' "$hashes"
+          {
+            echo "hashes<<REPRO_EOF"
+            printf '%s\n' "$hashes"
+            echo "REPRO_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render README with hashes
+        env:
+          HASHES: ${{ steps.hashes.outputs.hashes }}
+        run: |
+          set -euo pipefail
+          # Substitute the hash block; awk avoids sed's trouble with multi-line
+          # replacements and slashes in the content.
+          awk -v hashes="$HASHES" '{ gsub(/__HASHES__/, hashes); print }' \
+              out/README.partial.md > out/README.md
+
+      - name: Write job summary
+        env:
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          MODIFIER_LC: ${{ steps.ver.outputs.modifier_lc }}
+          OPEN_PR: ${{ inputs.open_pr }}
+        run: |
+          set -euo pipefail
+          dir="rskj/${VERSION}-${MODIFIER_LC}"
+          {
+            echo "## Reproducible build — \`${TAG}\`"
+            echo ""
+            echo "Target directory in \`reproducible-builds\`: \`${dir}\`"
+            echo "Open PR: \`${OPEN_PR}\`"
+            echo ""
+            echo "### Artifact hashes"
+            echo '```'
+            printf '%s\n' "${{ steps.hashes.outputs.hashes }}"
+            echo '```'
+            echo ""
+            echo "> Reproduce locally and confirm before merging:"
+            echo '```'
+            echo "docker build -t rskj/${VERSION}-${MODIFIER_LC} ."
+            echo "docker run --rm rskj/${VERSION}-${MODIFIER_LC} sh -c 'sha256sum * | grep -v javadoc.jar'"
+            echo '```'
+            echo ""
+            echo "<details><summary>Generated Dockerfile</summary>"
+            echo ""
+            echo '```dockerfile'
+            cat out/Dockerfile
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "<details><summary>Generated README.md</summary>"
+            echo ""
+            echo '```markdown'
+            cat out/README.md
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ----- everything below only runs when open_pr == true -----
+
+      - name: Mint scoped GitHub App token
+        if: ${{ inputs.open_pr }}
+        id: app-token
+        uses: actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b # v2.0.6
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: rsksmart
+          repositories: reproducible-builds
+
+      - name: Checkout reproducible-builds
+        if: ${{ inputs.open_pr }}
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          repository: rsksmart/reproducible-builds
+          token: ${{ steps.app-token.outputs.token }}
+          path: reproducible-builds
+
+      - name: Stage release directory
+        if: ${{ inputs.open_pr }}
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          MODIFIER_LC: ${{ steps.ver.outputs.modifier_lc }}
+        run: |
+          set -euo pipefail
+          dir="reproducible-builds/rskj/${VERSION}-${MODIFIER_LC}"
+          if [ -e "$dir" ]; then
+            echo "::error::${dir} already exists in reproducible-builds — refusing to overwrite an existing release."
+            exit 1
+          fi
+          mkdir -p "$dir"
+          cp out/Dockerfile "$dir/Dockerfile"
+          cp out/README.md  "$dir/README.md"
+
+      - name: Open pull request
+        if: ${{ inputs.open_pr }}
+        uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e # v7.0.8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          path: reproducible-builds
+          branch: reproducible-build/${{ inputs.tag }}
+          commit-message: "Adding reproducible build for ${{ inputs.tag }}"
+          title: "Adding reproducible build for ${{ inputs.tag }}"
+          body: |
+            Automated reproducible build for rskj tag `${{ inputs.tag }}`,
+            generated by the `Reproducible build` workflow in rskj.
+
+            **Before merging:** independently rebuild and confirm the hashes match.
+            CI is the first builder only — it is not the sole witness.
+
+            ```
+            ${{ steps.hashes.outputs.hashes }}
+            ```
+          delete-branch: true
